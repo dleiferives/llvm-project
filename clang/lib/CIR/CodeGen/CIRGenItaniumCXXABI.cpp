@@ -1571,15 +1571,14 @@ mlir::Attribute CIRGenItaniumRTTIBuilder::buildTypeInfo(
     break;
   }
 
-  case Type::ObjCObject:
+  case Type::ObjCObject: {
     // Drop protocol qualifiers.
     const Type *T = cast<ObjCObjectType>(ty)->getBaseType().getTypePtr();
-
     // The builtin types are abi::__class_type_infos and don't require
     // extra fields.
     if (isa<BuiltinType>(T))
       break;
-    [[fallthrough]];
+  } [[fallthrough]];
 
   case Type::ObjCInterface:
     cgm.errorNYI("buildTypeInfo: ObjCInterface");
@@ -1590,9 +1589,6 @@ mlir::Attribute CIRGenItaniumRTTIBuilder::buildTypeInfo(
     break;
 
   case Type::Pointer:
-    // We need to get the type info for the pointee type.
-    // TODO@(dleiferives): ask about this before making PR to #163601,
-    // needed for testing
     buildPointerTypeInfo(loc, cast<PointerType>(ty)->getPointeeType());
     break;
 
