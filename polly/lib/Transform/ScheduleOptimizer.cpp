@@ -137,6 +137,13 @@ static cl::list<int>
                                  "with --polly-default-tile-size"),
                         cl::Hidden, cl::CommaSeparated, cl::cat(PollyCategory));
 
+static cl::list<int> PerBandTileSizes(
+    "polly-per-band-tile-sizes",
+    cl::desc("Per-band tile sizes (comma-separated). Band 0 is the first "
+             "tileable band encountered, band 1 the second, etc. Falls back "
+             "to --polly-default-tile-size for unspecified bands."),
+    cl::Hidden, cl::CommaSeparated, cl::cat(PollyCategory));
+
 static cl::opt<bool>
     SecondLevelTiling("polly-2nd-level-tiling",
                       cl::desc("Enable a 2nd level loop of loop tiling"),
@@ -242,6 +249,7 @@ struct OptimizerAdditionalInfoTy {
   bool Prevect;
   bool &DepsChanged;
   IslMaxOperationsGuard &MaxOpGuard;
+  mutable int BandIdx = 0;
 };
 
 class ScheduleTreeOptimizer final {
@@ -375,7 +383,8 @@ private:
   /// Apply tiling optimizations on the bands in the schedule tree.
   ///
   /// @param Node The schedule node to (possibly) optimize.
-  static isl::schedule_node applyTileBandOpt(isl::schedule_node Node);
+  static isl::schedule_node applyTileBandOpt(isl::schedule_node Node,
+                                             int BandTileSize = -1);
 
   /// Apply prevectorization on the bands in the schedule tree.
   ///
@@ -526,11 +535,18 @@ bool ScheduleTreeOptimizer::isPMOptimizableBandNode(isl::schedule_node Node) {
 }
 
 __isl_give isl::schedule_node
-ScheduleTreeOptimizer::applyTileBandOpt(isl::schedule_node Node) {
+ScheduleTreeOptimizer::applyTileBandOpt(isl::schedule_node Node,
+                                        int BandTileSize) {
   if (FirstLevelTiling) {
-    Node = tileNode(Node, "1st level tiling", FirstLevelTileSizes,
-                    FirstLevelDefaultTileSize);
-    FirstLevelTileOpts++;
+    if (BandTileSize == 0) {
+      // size=0 means "don't tile this band"
+    } else {
+      int EffectiveSize =
+          BandTileSize > 0 ? BandTileSize : (int)FirstLevelDefaultTileSize;
+      Node = tileNode(Node, "1st level tiling", FirstLevelTileSizes,
+                      EffectiveSize);
+      FirstLevelTileOpts++;
+    }
   }
 
   if (SecondLevelTiling) {
@@ -586,8 +602,18 @@ ScheduleTreeOptimizer::optimizeBand(__isl_take isl_schedule_node *NodeArg,
   if (!isTileableBandNode(Node))
     return Node.release();
 
-  if (OAI->Postopts)
-    Node = applyTileBandOpt(Node);
+  if (OAI->Postopts) {
+    int idx = OAI->BandIdx++;
+    int perBandSize = (idx < (int)PerBandTileSizes.size())
+                          ? PerBandTileSizes[idx]
+                          : -1;
+    llvm::errs() << "[polly-per-band] band " << idx << ": size="
+                 << (perBandSize >= 0 ? perBandSize
+                                      : (int)FirstLevelDefaultTileSize)
+                 << (perBandSize < 0 ? " (default)" : "")
+                 << (perBandSize == 0 ? " (skip)" : "") << "\n";
+    Node = applyTileBandOpt(Node, perBandSize);
+  }
 
   if (OAI->Prevect) {
     IslQuotaScope MaxScope = OAI->MaxOpGuard.enter();
