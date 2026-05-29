@@ -19,6 +19,7 @@
 #include "polly/ScopDetectionDiagnostic.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/InstrTypes.h"
 #include "isl/ctx.h"
 #include "isl/isl-noexceptions.h"
@@ -169,6 +170,14 @@ protected:
 
   /// A collection of all parallel subfunctions that have been created.
   SmallVector<Function *, 8> ParallelSubfunctions;
+
+  /// Band index set by a polly.band_idx mark; -1 means not in a tracked band.
+  int CurrentBandIdx = -1;
+
+  /// DebugLoc harvested from the first statement in the current band.
+  /// Used to annotate the tiled loop back-edge so DWARF line-table attribution
+  /// can map miss PCs back to the band's source line.
+  DebugLoc CurrentBandDebugLoc;
 
   /// Generate code for a given SCEV*
   ///

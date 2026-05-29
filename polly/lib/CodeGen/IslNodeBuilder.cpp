@@ -47,6 +47,8 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Casting.h"
@@ -381,12 +383,27 @@ void IslNodeBuilder::createMark(__isl_take isl_ast_node *Node) {
   auto *Id = isl_ast_node_mark_get_id(Node);
   auto Child = isl_ast_node_mark_get_node(Node);
   isl_ast_node_free(Node);
+
+  const char *IdName = isl_id_get_name(Id);
+
+  // Check for our band-attribution mark inserted by ScheduleOptimizer.
+  // Format: "polly.band_idx.<N>"
+  static constexpr const char BandIdxPrefix[] = "polly.band_idx.";
+  static constexpr size_t BandIdxPrefixLen = sizeof(BandIdxPrefix) - 1;
+  int SavedBandIdx = CurrentBandIdx;
+  DebugLoc SavedMarkDebugLoc = CurrentBandDebugLoc;
+  if (strncmp(IdName, BandIdxPrefix, BandIdxPrefixLen) == 0) {
+    CurrentBandIdx = std::stoi(IdName + BandIdxPrefixLen);
+    CurrentBandDebugLoc = DebugLoc();  // reset so createUser can harvest fresh
+  }
+
   // If a child node of a 'SIMD mark' is a loop that has a single iteration,
   // it will be optimized away and we should skip it.
-  if (strcmp(isl_id_get_name(Id), "SIMD") == 0 &&
+  if (strcmp(IdName, "SIMD") == 0 &&
       isl_ast_node_get_type(Child) == isl_ast_node_for) {
     createForSequential(isl::manage(Child).as<isl::ast_node_for>(), true);
     isl_id_free(Id);
+    CurrentBandIdx = SavedBandIdx;
     return;
   }
 
@@ -410,6 +427,8 @@ void IslNodeBuilder::createMark(__isl_take isl_ast_node *Node) {
     Annotator.getStagingAttrEnv() = AncestorLoopAttr;
   }
 
+  CurrentBandIdx = SavedBandIdx;
+  CurrentBandDebugLoc = SavedMarkDebugLoc;
   isl_id_free(Id);
 }
 
@@ -483,7 +502,39 @@ void IslNodeBuilder::createForSequential(isl::ast_node_for For,
                   LoopVectorizerDisabled);
   IDToValue[IteratorID.get()] = IV;
 
+  // Attach !llvm.loop band attribution metadata if inside a tracked band.
+  CondBrInst *BandLatchBr = nullptr;
+  if (CurrentBandIdx >= 0) {
+    BasicBlock *HeaderBB = cast<PHINode>(IV)->getParent();
+    CondBrInst *LatchBr = cast<CondBrInst>(HeaderBB->getTerminator());
+    LLVMContext &Ctx = HeaderBB->getContext();
+
+    MDNode *BandIdxMD = MDNode::get(Ctx, {
+        MDString::get(Ctx, "polly.band_idx"),
+        ConstantAsMetadata::get(
+            ConstantInt::get(Type::getInt32Ty(Ctx), CurrentBandIdx))});
+
+    MDNode *ExistingMD = LatchBr->getMetadata(LLVMContext::MD_loop);
+    SmallVector<Metadata *, 4> Ops;
+    if (ExistingMD) {
+      for (const MDOperand &Op : ExistingMD->operands())
+        Ops.push_back(Op.get());
+    } else {
+      Ops.push_back(nullptr); // placeholder for self-reference
+    }
+    Ops.push_back(BandIdxMD);
+    MDNode *NewLoopID = MDNode::getDistinct(Ctx, Ops);
+    NewLoopID->replaceOperandWith(0, NewLoopID);
+    LatchBr->setMetadata(LLVMContext::MD_loop, NewLoopID);
+    BandLatchBr = LatchBr;
+  }
+
   create(Body.release());
+
+  // Propagate the harvested source DebugLoc onto the latch back-edge so the
+  // DWARF line table can map miss PCs to the band's source line.
+  if (BandLatchBr && CurrentBandDebugLoc)
+    BandLatchBr->setDebugLoc(CurrentBandDebugLoc);
 
   Annotator.popLoop(MarkParallel);
 
@@ -910,6 +961,21 @@ void IslNodeBuilder::createUser(__isl_take isl_ast_node *User) {
   LTS.insert_range(OutsideLoopIterations);
 
   Stmt = (ScopStmt *)isl_id_get_user(Id);
+
+  // Harvest a DebugLoc from this statement's original instructions so we can
+  // annotate the enclosing tiled band's back-edge for DWARF attribution.
+  if (CurrentBandIdx >= 0 && !CurrentBandDebugLoc) {
+    BasicBlock *OrigBB = Stmt->getEntryBlock();
+    if (OrigBB) {
+      for (Instruction &I : *OrigBB) {
+        if (DebugLoc DL = I.getDebugLoc()) {
+          CurrentBandDebugLoc = DL;
+          break;
+        }
+      }
+    }
+  }
+
   auto *NewAccesses = createNewAccesses(Stmt, User);
   if (Stmt->isCopyStmt()) {
     generateCopyStmt(Stmt, NewAccesses);

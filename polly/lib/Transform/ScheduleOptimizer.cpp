@@ -60,6 +60,9 @@
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Support/CommandLine.h"
 #include "isl/options.h"
+#include "isl/schedule_node.h"
+#include <fstream>
+#include <sstream>
 
 using namespace llvm;
 using namespace polly;
@@ -198,6 +201,12 @@ static cl::opt<bool>
                             "tiling (requires -polly-reschedule)"),
                    cl::init(true), cl::cat(PollyCategory));
 
+static cl::opt<std::string> EmitBandInfo(
+    "polly-emit-band-info",
+    cl::desc("Write band info JSON (index, schedule, domain, accesses) to this "
+             "file. Append one JSON object per SCoP. Used for PGO tile sizing."),
+    cl::Hidden, cl::init(""), cl::cat(PollyCategory));
+
 static cl::opt<bool> OptimizedScops(
     "polly-optimized-scops",
     cl::desc("Polly - Dump polyhedral description of Scops optimized with "
@@ -237,6 +246,23 @@ STATISTIC(MatMulOpts,
           "Number of matrix multiplication patterns detected and optimized");
 
 namespace {
+/// Per-band metadata collected during tiling for the band-info JSON.
+struct BandInfoEntry {
+  int Index;
+  int NDims;
+  int TileSize;
+  std::string PartialSchedule;
+  std::string Domain;
+  struct AccessEntry {
+    std::string ArrayName;
+    std::string AccessMap;
+    bool IsRead;
+    bool IsWrite;
+    unsigned ElementBytes;
+  };
+  std::vector<AccessEntry> Accesses;
+};
+
 /// Additional parameters of the schedule optimizer.
 ///
 /// Target Transform Info and the SCoP dependencies used by the schedule
@@ -250,6 +276,8 @@ struct OptimizerAdditionalInfoTy {
   bool &DepsChanged;
   IslMaxOperationsGuard &MaxOpGuard;
   mutable int BandIdx = 0;
+  Scop *S = nullptr;
+  mutable std::vector<BandInfoEntry> BandInfoList;
 };
 
 class ScheduleTreeOptimizer final {
@@ -607,12 +635,93 @@ ScheduleTreeOptimizer::optimizeBand(__isl_take isl_schedule_node *NodeArg,
     int perBandSize = (idx < (int)PerBandTileSizes.size())
                           ? PerBandTileSizes[idx]
                           : -1;
-    llvm::errs() << "[polly-per-band] band " << idx << ": size="
+
+    // Dump band structure for research analysis.
+    int nMember = isl_schedule_node_band_n_member(Node.get());
+    isl_ctx *Ctx = isl_schedule_node_get_ctx(Node.get());
+
+    // Partial schedule: shows which loop dimensions this band covers.
+    isl_multi_union_pw_aff *Partial =
+        isl_schedule_node_band_get_partial_schedule(Node.get());
+    isl_printer *P = isl_printer_to_str(Ctx);
+    P = isl_printer_print_multi_union_pw_aff(P, Partial);
+    char *PartialStr = isl_printer_get_str(P);
+    isl_printer_free(P);
+    isl_multi_union_pw_aff_free(Partial);
+
+    // Domain: shows which statements are in this band.
+    isl_union_set *Domain = isl_schedule_node_get_domain(Node.get());
+    P = isl_printer_to_str(Ctx);
+    P = isl_printer_print_union_set(P, Domain);
+    char *DomainStr = isl_printer_get_str(P);
+    isl_printer_free(P);
+
+    llvm::errs() << "[polly-per-band] band " << idx
+                 << ": ndims=" << nMember
+                 << " size="
                  << (perBandSize >= 0 ? perBandSize
                                       : (int)FirstLevelDefaultTileSize)
                  << (perBandSize < 0 ? " (default)" : "")
-                 << (perBandSize == 0 ? " (skip)" : "") << "\n";
+                 << (perBandSize == 0 ? " (skip)" : "")
+                 << "\n  partial_schedule: " << PartialStr
+                 << "\n  domain:           " << DomainStr << "\n";
+
+    // Collect band info for JSON export (Tasks 6+7).
+    if (!EmitBandInfo.empty()) {
+      BandInfoEntry Entry;
+      Entry.Index = idx;
+      Entry.NDims = nMember;
+      Entry.TileSize = (perBandSize >= 0 ? perBandSize
+                                         : (int)FirstLevelDefaultTileSize);
+      Entry.PartialSchedule = PartialStr;
+      Entry.Domain = DomainStr;
+
+      // Collect memory access relations for statements in this band.
+      if (OAI->S) {
+        isl::union_set BandDomain = isl::manage(Domain);
+        Domain = nullptr; // transferred ownership to BandDomain
+        for (auto &Stmt : *OAI->S) {
+          // Check if this statement's domain overlaps the band domain.
+          isl::set StmtDomain = Stmt.getDomain();
+          isl::union_set StmtUD =
+              isl::manage(isl_union_set_from_set(StmtDomain.copy()));
+          if (StmtUD.intersect(BandDomain).is_empty())
+            continue;
+          for (auto *MA : Stmt) {
+            if (MA->isScalarKind())
+              continue;
+            BandInfoEntry::AccessEntry AE;
+            const ScopArrayInfo *SAI = MA->getScopArrayInfo();
+            AE.ArrayName = SAI ? SAI->getName() : "unknown";
+            AE.AccessMap = MA->getOriginalAccessRelationStr();
+            AE.IsRead = MA->isRead();
+            AE.IsWrite = MA->isWrite();
+            llvm::Type *ET = MA->getElementType();
+            AE.ElementBytes =
+                ET ? (ET->getPrimitiveSizeInBits() / 8) : 0;
+            Entry.Accesses.push_back(std::move(AE));
+          }
+        }
+      }
+
+      OAI->BandInfoList.push_back(std::move(Entry));
+    }
+
+    if (Domain)
+      isl_union_set_free(Domain);
+
+    free(PartialStr);
+    free(DomainStr);
+
     Node = applyTileBandOpt(Node, perBandSize);
+
+    // Insert a mark node above the tiled band so IslNodeBuilder can attribute
+    // generated loop PCs to this band index via !llvm.loop metadata.
+    if (!EmitBandInfo.empty()) {
+      std::string MarkName = "polly.band_idx." + std::to_string(idx);
+      isl_id *MarkId = isl_id_alloc(Ctx, MarkName.c_str(), nullptr);
+      Node = isl::manage(isl_schedule_node_insert_mark(Node.release(), MarkId));
+    }
   }
 
   if (OAI->Prevect) {
@@ -914,19 +1023,68 @@ static void runIslScheduleOptimizerImpl(
   }
 
   // Apply post-rescheduling optimizations (if enabled) and/or prevectorization.
-  const OptimizerAdditionalInfoTy OAI = {
+  OptimizerAdditionalInfoTy OAI = {
       TTI,
       const_cast<Dependences *>(&D),
       /*PatternOpts=*/!HasUserTransformation && PMBasedOpts,
       /*Postopts=*/!HasUserTransformation && EnablePostopts,
       /*Prevect=*/PollyVectorizerChoice != VECTORIZER_NONE,
       DepsChanged,
-      MaxOpGuard};
+      MaxOpGuard,
+      /*BandIdx=*/0,
+      /*S=*/&S};
   if (!Schedule.is_null() && (OAI.PatternOpts || OAI.Postopts || OAI.Prevect)) {
     Schedule = ScheduleTreeOptimizer::optimizeSchedule(Schedule, &OAI);
     Schedule = hoistExtensionNodes(Schedule);
     POLLY_DEBUG(printSchedule(dbgs(), Schedule, "After post-optimizations"));
     walkScheduleTreeForStatistics(Schedule, 2);
+  }
+
+  // Write band-info JSON if requested (Tasks 6+7).
+  if (!EmitBandInfo.empty() && !OAI.BandInfoList.empty()) {
+    std::ofstream Out(EmitBandInfo, std::ios::app);
+    if (Out.is_open()) {
+      // Escape a string for JSON: replace \ and " only.
+      auto jsonStr = [](const std::string &s) -> std::string {
+        std::string r;
+        r.reserve(s.size() + 4);
+        r += '"';
+        for (char c : s) {
+          if (c == '"') r += "\\\"";
+          else if (c == '\\') r += "\\\\";
+          else r += c;
+        }
+        r += '"';
+        return r;
+      };
+
+      // Write one compact JSON object per SCoP (JSON Lines format).
+      Out << "{\"function\":" << jsonStr(S.getFunction().getName().str())
+          << ",\"scop\":" << jsonStr(S.getName().str())
+          << ",\"bands\":[";
+      for (size_t bi = 0; bi < OAI.BandInfoList.size(); ++bi) {
+        const BandInfoEntry &B = OAI.BandInfoList[bi];
+        if (bi > 0) Out << ",";
+        Out << "{\"index\":" << B.Index
+            << ",\"ndims\":" << B.NDims
+            << ",\"tile_size\":" << B.TileSize
+            << ",\"partial_schedule\":" << jsonStr(B.PartialSchedule)
+            << ",\"domain\":" << jsonStr(B.Domain)
+            << ",\"accesses\":[";
+        for (size_t ai = 0; ai < B.Accesses.size(); ++ai) {
+          const BandInfoEntry::AccessEntry &A = B.Accesses[ai];
+          if (ai > 0) Out << ",";
+          Out << "{\"array\":" << jsonStr(A.ArrayName)
+              << ",\"access_map\":" << jsonStr(A.AccessMap)
+              << ",\"is_read\":" << (A.IsRead ? "true" : "false")
+              << ",\"is_write\":" << (A.IsWrite ? "true" : "false")
+              << ",\"element_bytes\":" << A.ElementBytes
+              << "}";
+        }
+        Out << "]}";
+      }
+      Out << "]}\n";
+    }
   }
 
   // Check for why any computation could have failed
